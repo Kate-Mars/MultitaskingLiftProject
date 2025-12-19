@@ -8,8 +8,6 @@ public final class ElevatorSnapshot {
     private final int load;
     private final int capacity;
     private final int plannedStops;
-
-    // 0 означает "нет целей в эту сторону"
     private final int furthestUpStop;
     private final int furthestDownStop;
 
