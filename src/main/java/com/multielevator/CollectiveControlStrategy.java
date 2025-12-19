@@ -1,8 +1,6 @@
 package com.multielevator;
 
 /**
- * Упрощённая стратегия collective control.
- *
  * Идея: выбрать лифт с минимальной стоимостью принятия вызова, учитывая
  * расстояние, направление, загрузку и текущую длину маршрута.
  */
@@ -11,12 +9,7 @@ public final class CollectiveControlStrategy {
     public int calculateCost(ElevatorSnapshot s, HallCall call) {
         final int targetFloor = call.floor();
         final Direction reqDir = call.direction();
-
-        // Мягкое зонирование: повышаем стоимость, если вызов вне предпочтительной зоны лифта.
-        // Это не запрет, а лишь «наклон» выбора.
         final int zonePenalty = Config.zonePenalty(s.id(), targetFloor);
-
-        // В реальном лифте важно не просто расстояние, а "ETA" с учётом разворота.
         int etaDistance;
 
         double directionPenalty;
@@ -28,7 +21,7 @@ public final class CollectiveControlStrategy {
                 etaDistance = Math.abs(s.currentFloor() - targetFloor);
                 directionPenalty = 1.0;
             } else {
-                // Вызов "позади": лифт доедет до ближайшей границы своего маршрута и вернётся.
+                // лифт доедет до ближайшей границы своего маршрута и вернётся.
                 int end = (s.direction() == Direction.UP)
                         ? (s.furthestUpStop() > 0 ? s.furthestUpStop() : s.currentFloor())
                         : (s.furthestDownStop() > 0 ? s.furthestDownStop() : s.currentFloor());
@@ -36,7 +29,6 @@ public final class CollectiveControlStrategy {
                 directionPenalty = 6.0;
             }
         } else {
-            // Противоположное направление: считаем как "до разворота + до цели"
             int end = (s.direction() == Direction.UP)
                     ? (s.furthestUpStop() > 0 ? s.furthestUpStop() : s.currentFloor())
                     : (s.furthestDownStop() > 0 ? s.furthestDownStop() : s.currentFloor());
