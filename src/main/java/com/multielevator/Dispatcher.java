@@ -24,11 +24,7 @@ public class Dispatcher implements Runnable {
 
     private final int totalFloors;
     private final List<Elevator> elevators = new ArrayList<>();
-
-    // Входящие запросы от пассажиров (оставлено для совместимости, но в v5 обработка событийная)
     private final BlockingQueue<Passenger> incoming = new LinkedBlockingQueue<>();
-
-    // Единая очередь событий (пассажиры + изменения состояния лифтов)
     private final BlockingQueue<DispatcherEvent> events = new LinkedBlockingQueue<>();
 
     private static final class DispatcherEvent {
@@ -44,31 +40,17 @@ public class Dispatcher implements Runnable {
         }
     }
 
-    // Очереди ожидания по этажам и направлениям
     @SuppressWarnings("unchecked")
     private final ConcurrentLinkedQueue<Passenger>[] waitingUp;
     @SuppressWarnings("unchecked")
     private final ConcurrentLinkedQueue<Passenger>[] waitingDown;
-
-    // Быстрые счётчики ожиданий (чтобы не делать size() у ConcurrentLinkedQueue)
     private final AtomicIntegerArray waitingUpCount;
     private final AtomicIntegerArray waitingDownCount;
-
-    // Набор активных внешних вызовов (этаж + направление), которые надо обслужить
     private final Set<HallCall> pendingCalls = new ConcurrentSkipListSet<>();
-
-    // Текущее назначение лифта для каждого внешнего вызова (чтобы не раздавать один вызов сразу всем)
     private final ConcurrentHashMap<HallCall, Elevator> assignedElevator = new ConcurrentHashMap<>();
-
-    // Чтобы не заспамить логами "NO_ELEVATOR" на каждом тике, троттлим сообщения.
     private final ConcurrentHashMap<HallCall, Long> lastNoElevatorLogMs = new ConcurrentHashMap<>();
-
-    // Антидёрганье: не переназначаем один и тот же hall-call слишком часто.
     private final ConcurrentHashMap<HallCall, Long> lastReassignMs = new ConcurrentHashMap<>();
-
     private static final long NO_ELEVATOR_LOG_COOLDOWN_MS = Config.NO_ELEVATOR_LOG_COOLDOWN_MS;
-
-    // Стратегия collective control
     private final CollectiveControlStrategy strategy = new CollectiveControlStrategy();
 
     private volatile boolean running = true;
@@ -85,18 +67,9 @@ public class Dispatcher implements Runnable {
         this.waitingUpCount = new AtomicIntegerArray(totalFloors + 1);
         this.waitingDownCount = new AtomicIntegerArray(totalFloors + 1);
     }
-
-    /** Количество этажей (для визуализации/диагностики). */
     public int getTotalFloors() {
         return totalFloors;
     }
-
-    /**
-     * "Подсмотреть" (без удаления) ожидающих пассажиров на этаже.
-     *
-     * Важно: ConcurrentLinkedQueue не даёт безопасного snapshot-итератора с фиксированным размером,
-     * поэтому метод возвращает "best effort" список: он подходит для визуализации, но не для логики.
-     */
     public List<Passenger> peekWaitingPassengers(int floor, Direction dir, int limit) {
         if (limit <= 0) return List.of();
         if (floor < 1 || floor > totalFloors) return List.of();
@@ -118,33 +91,15 @@ public class Dispatcher implements Runnable {
     public void registerElevator(Elevator e) {
         elevators.add(Objects.requireNonNull(e));
     }
-
-    
-
-    /**
-     * Уведомление от лифта: изменилось состояние (двери закрылись/лифт стал idle/изменилась загрузка).
-     * Это позволяет диспетчеру немедленно перераспределять ожидающие вызовы, как в реальной системе,
-     * а не опрашивать лифты по таймеру.
-     */
     public void notifyElevatorUpdate(Elevator e) {
         if (e == null) return;
         events.offer(new DispatcherEvent(DispatcherEvent.Type.ELEVATOR_UPDATE, null, e));
     }
-/**
-     * Пассажир отправляет запрос (внешний вызов).
-     * Потокобезопасно: кладём в очередь, дальше диспетчер разберётся.
-     */
     public void submitRequest(Passenger p) {
         log("REQUEST", p + " waiting at floor " + p.getStartFloor() + " dir=" + p.getDirection());
-        // событийная модель: сразу ставим событие, чтобы диспетчер проснулся
         events.offer(new DispatcherEvent(DispatcherEvent.Type.PASSENGER_REQUEST, p, null));
-        incoming.offer(p); // совместимость/диагностика
+        incoming.offer(p);
     }
-
-    /**
-     * Лифт забирает пассажиров с этажа по заданному направлению.
-     * Возвращает список реально севших пассажиров.
-     */
     public List<Passenger> boardPassengers(int floor, Direction dir, int spaceAvailable) {
         if (spaceAvailable <= 0) return List.of();
         if (floor < 1 || floor > totalFloors) return List.of();
@@ -160,9 +115,6 @@ public class Dispatcher implements Runnable {
             result.add(p);
             spaceAvailable--;
         }
-
-        // если очередь на этаже/направлении опустела — убираем pending-вызов
-        // и отменяем назначение у лифта, чтобы он не ехал «впустую».
         if (getWaitingCount(floor, dir) == 0) {
             HallCall key = new HallCall(floor, dir);
             pendingCalls.remove(key);
@@ -172,7 +124,6 @@ public class Dispatcher implements Runnable {
                 assigned.cancelHallCall(floor, dir);
             }
         }
-
         return result;
     }
 
@@ -188,21 +139,6 @@ public class Dispatcher implements Runnable {
     public void shutdown() {
         running = false;
     }
-
-    /**
-     * "Захват" hall-call для остановки "по пути".
-     *
-     * Мотивация: диспетчер может назначить вызов лифту, пока тот уже движется к другой цели.
-     * Если лифт выбирает цель один раз (target) и едет до неё без промежуточной проверки,
-     * он может фактически проехать этаж с ожидающими пассажирами, хотя мог бы забрать.
-     *
-     * Этот метод вызывается лифтом, когда он находится НА ЭТАЖЕ и готов открыть двери:
-     * мы переназначаем вызов на текущий лифт (если люди всё ещё ждут), а старому лифту
-     * отправляем cancelHallCall, чтобы он не приехал впустую.
-     *
-     * Возвращает true, если на этаже действительно есть ожидающие в этом направлении и
-     * вызов успешно "закреплён" за данным лифтом.
-     */
     public boolean claimHallCallAtFloor(int floor, Direction dir, Elevator claimer) {
         if (claimer == null) return false;
         if (floor < 1 || floor > totalFloors) return false;
@@ -211,7 +147,7 @@ public class Dispatcher implements Runnable {
         HallCall call = new HallCall(floor, dir);
         pendingCalls.add(call);
 
-        // Важно: мы здесь намеренно "крадём" назначение, потому что лифт уже НА ЭТАЖЕ.
+        // мы здесь намеренно "крадём" назначение, потому что лифт уже НА ЭТАЖЕ.
         Elevator prev = assignedElevator.put(call, claimer);
         if (prev != null && prev != claimer) {
             prev.cancelHallCall(floor, dir);
@@ -220,18 +156,10 @@ public class Dispatcher implements Runnable {
         lastNoElevatorLogMs.remove(call);
         return true;
     }
-
-    /** Текущий назначенный лифт для hall-call (для "по пути" решений). */
     public Elevator getAssignedElevator(int floor, Direction dir) {
         if (floor < 1 || floor > totalFloors) return null;
         return assignedElevator.get(new HallCall(floor, dir));
     }
-
-    /**
-     * Система «пустая»: нет ожидающих пассажиров, нет hall-call в pending,
-     * и очередь событий тоже пуста.
-     * Удобно для корректного завершения симуляции.
-     */
     public boolean isIdle() {
         return getTotalWaiting() == 0 && pendingCalls.isEmpty() && assignedElevator.isEmpty() && events.isEmpty();
     }
@@ -252,11 +180,9 @@ public class Dispatcher implements Runnable {
 
         while (running) {
             try {
-                // Событийная модель: ждём либо новый запрос пассажира, либо изменение состояния лифта.
                 DispatcherEvent ev = events.poll(1, TimeUnit.SECONDS);
 
                 if (ev != null) {
-                    // Обрабатываем одно событие и добираем пачку, чтобы не дергать dispatch слишком часто
                     handleEvent(ev);
 
                     for (int i = 0; i < Config.DISPATCHER_EVENT_BATCH; i++) {
@@ -265,10 +191,8 @@ public class Dispatcher implements Runnable {
                         handleEvent(next);
                     }
 
-                    // После пачки событий — одна попытка диспетчеризации
                     dispatchPendingCalls();
                 } else {
-                    // Периодический "страховочный" тик на случай пропущенных уведомлений
                     dispatchPendingCalls();
                 }
 
@@ -293,9 +217,6 @@ public class Dispatcher implements Runnable {
             enqueueWaiting(ev.passenger);
             return;
         }
-
-        // ELEVATOR_UPDATE: ничего не делаем прямо здесь — это "триггер" для dispatchPendingCalls()
-        // чтобы перераспределение происходило сразу после закрытия дверей/разгрузки/idle.
     }
 
 
@@ -319,29 +240,20 @@ public class Dispatcher implements Runnable {
     }
 
     private void dispatchPendingCalls() {
-        // Берём "снимок" очереди, чтобы не держать долгих блокировок
         List<HallCall> snapshot = new ArrayList<>(pendingCalls);
 
         for (HallCall call : snapshot) {
             if (call == null) continue;
-
-            // Если на этаже уже никого не ждёт (например, часть пассажиров уехала),
-            // гасим вызов, как это делает реальная кнопка после обслуживания.
             if (!hasWaiting(call.floor(), call.direction())) {
                 pendingCalls.remove(call);
                 assignedElevator.remove(call);
                 lastNoElevatorLogMs.remove(call);
                 continue;
             }
-
-            // Если вызов уже закреплён за лифтом — обычно не трогаем.
-            // Но иногда пассажиры выглядят "пропущенными": другой лифт фактически едет мимо
-            // и мог бы забрать людей быстрее. Поэтому разрешаем "steal/reassign" с гистерезисом.
             Elevator assigned = assignedElevator.get(call);
             if (assigned != null) {
                 if (assigned.canContinueServingAssignedCall(call)) {
                     if (shouldReassign(call, assigned)) {
-                        // Снимаем текущее назначение и даём шанс выбрать более подходящий лифт ниже.
                         assignedElevator.remove(call);
                         assigned.cancelHallCall(call.floor(), call.direction());
                         lastReassignMs.put(call, System.currentTimeMillis());
@@ -349,17 +261,13 @@ public class Dispatcher implements Runnable {
                         continue;
                     }
                 } else {
-                    // лифт стал неподходящим (full/слишком много стопов и т.п.) — возвращаем в общий пул
                     assignedElevator.remove(call);
-                    // И обязательно снимаем вызов с маршрута/резерва лифта,
-                    // иначе возможны «призрачные» остановки и дублирование обслуживания.
                     assigned.cancelHallCall(call.floor(), call.direction());
                 }
             }
 
             AssignResult pick = findBestElevator(call);
             if (pick.elevator == null) {
-                // Не спамим логами: для каждого вызова — не чаще, чем раз в cooldown
                 long now = System.currentTimeMillis();
                 Long last = lastNoElevatorLogMs.get(call);
                 if (last == null || (now - last) >= NO_ELEVATOR_LOG_COOLDOWN_MS) {
@@ -375,7 +283,6 @@ public class Dispatcher implements Runnable {
                     ? pick.elevator.tryReserveHallCall(call)
                     : pick.elevator.tryAddHallCall(call.floor(), call.direction());
             if (!acceptedNow) {
-                // гонка/переполнение: оставляем вызов в ожидании
                 log("ASSIGN", call + " -> Elevator-" + pick.elevator.getId()
                         + " (at " + sBefore.currentFloor()
                         + ", going " + sBefore.direction()
@@ -384,8 +291,6 @@ public class Dispatcher implements Runnable {
                         + ") - REJECTED: " + HallCallRejectReason.FULL_CAPACITY);
                 continue;
             }
-
-            // Успешное назначение (сам вызов остаётся в pendingCalls до реального обслуживания)
             assignedElevator.put(call, pick.elevator);
             lastNoElevatorLogMs.remove(call);
 
@@ -399,9 +304,6 @@ public class Dispatcher implements Runnable {
         }
     }
 
-    /**
-     * Выбор лифта по collective control с учётом направления и загрузки.
-     */
     private AssignResult findBestElevator(HallCall call) {
         Elevator best = null;
         int minCost = Integer.MAX_VALUE;
@@ -412,11 +314,9 @@ public class Dispatcher implements Runnable {
         int stopLimit = 0;
         int doorsBusy = 0;
 
-        // PASS 1: строгий отбор (только ACCEPTED)
         for (Elevator e : elevators) {
             HallCallRejectReason reason = e.canAcceptHallCallReason(call);
             if (reason == HallCallRejectReason.ACCEPTED_RESERVED) {
-                // рассмотрим на отдельном проходе с большим штрафом
                 continue;
             }
             if (reason != HallCallRejectReason.ACCEPTED) {
@@ -436,8 +336,6 @@ public class Dispatcher implements Runnable {
 
             int assigned = assignedCountFor(e);
             cost += assigned * 6;
-
-            // приоритет лифтам, которые уже «по пути»
             if (strategy.isOnTheWay(s, call)) {
                 cost -= 3;
             }
@@ -446,7 +344,6 @@ public class Dispatcher implements Runnable {
                 minCost = cost;
                 best = e;
             } else if (cost == minCost && best != null) {
-                // Tie-break: меньше назначений -> меньше запланированных остановок -> меньше загрузка
                 int aBest = assignedCountFor(best);
                 if (assigned < aBest) {
                     best = e;
@@ -465,8 +362,6 @@ public class Dispatcher implements Runnable {
             return new AssignResult(best, PickMode.NORMAL, full, wrongDir, outOfRoute, stopLimit, doorsBusy);
         }
 
-        // PASS 1b: предварительное назначение (ACCEPTED_RESERVED) — противоположное направление,
-        // но лифт пустой и скоро развернётся. Даём большой штраф, чтобы выбиралось только когда разумно.
         Elevator bestReserved = null;
         int minReservedCost = Integer.MAX_VALUE;
         for (Elevator e : elevators) {
@@ -564,18 +459,15 @@ public class Dispatcher implements Runnable {
             return false;
         }
 
-        // Если лифт уже явно взял этот вызов в маршрут/резерв — не трогаем.
         if (currentlyAssigned.isCommittedToHallCall(call)) return false;
 
         ElevatorSnapshot sa = currentlyAssigned.snapshot();
         if (Math.abs(sa.currentFloor() - call.floor()) <= 1) return false;
 
-        // Найдём лучшего кандидата по текущим условиям.
         AssignResult best = findBestElevator(call);
         if (best.elevator == null) return false;
         if (best.elevator == currentlyAssigned) return false;
 
-        // Переназначаем только если новый лифт реально "по пути" или свободен.
         ElevatorSnapshot sb = best.elevator.snapshot();
         boolean bestOk = (sb.direction() == Direction.IDLE) || strategy.isOnTheWay(sb, call);
         if (!bestOk) return false;
@@ -586,7 +478,6 @@ public class Dispatcher implements Runnable {
         return (costAssigned - costBest) >= Config.CALL_REASSIGN_MIN_IMPROVEMENT;
     }
 
-    /** Стоимость, согласованная с findBestElevator (включая балансировку по назначенным вызовам). */
     private int effectiveCost(ElevatorSnapshot s, HallCall call, int assignedCount) {
         int cost = strategy.calculateCost(s, call);
         cost += assignedCount * 6;
